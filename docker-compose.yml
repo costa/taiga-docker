@@ -1,5 +1,3 @@
-version: "3.5"
-
 x-environment:
   &default-back-environment
   # These environment variables will be used by taiga-back and taiga-async.
@@ -32,11 +30,33 @@ x-environment:
 x-volumes:
   &default-back-volumes
   # These volumens will be used by taiga-back and taiga-async.
-  - taiga-static-data:/taiga-back/static
-  - taiga-media-data:/taiga-back/media
+  - type: volume
+    source: taiga
+    target: /taiga-back/static
+    volume:
+      subpath: static-data
+  - type: volume
+    source: taiga
+    target: /taiga-back/media
+    volume:
+      subpath: media-data
   # - ./config.py:/taiga-back/settings/config.py
 
 services:
+  _pre_init-taiga:
+    image: taigaio/taiga-back:latest
+    entrypoint: ""
+    volumes:
+      - taiga:/taiga
+    working_dir: /taiga
+    command:
+      - /bin/bash
+      - -ec
+      - |
+        cp -a /taiga-back/static static-data
+        cp -a /taiga-back/media media-data
+        mkdir -p db-data async-rabbitmq-data events-rabbitmq-data
+
   taiga-db:
     image: postgres:12.3
     environment:
@@ -45,43 +65,61 @@ services:
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
-      interval: 2s
+      interval: 20s
       timeout: 15s
       retries: 5
-      start_period: 3s
+      start_period: 5s
     volumes:
-      - taiga-db-data:/var/lib/postgresql/data
-    networks:
-      - taiga
+      - type: volume
+        source: taiga
+        target: /var/lib/postgresql/data
+        volume:
+          subpath: db-data
+    depends_on:
+      _pre_init-taiga:
+        condition: service_completed_successfully
+    restart: on-failure
 
   taiga-back:
-    image: taigaio/taiga-back:latest
+    build:
+      dockerfile_inline: |
+        FROM taigaio/taiga-back:latest
+        RUN apt update && apt install -y curl
     environment: *default-back-environment
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+      start_interval: 5s
     volumes: *default-back-volumes
-    networks:
-      - taiga
     depends_on:
+      _pre_init-taiga:
+        condition: service_completed_successfully
       taiga-db:
         condition: service_healthy
       taiga-events-rabbitmq:
         condition: service_started
       taiga-async-rabbitmq:
         condition: service_started
+    restart: on-failure
 
   taiga-async:
     image: taigaio/taiga-back:latest
     entrypoint: ["/taiga-back/docker/async_entrypoint.sh"]
     environment: *default-back-environment
     volumes: *default-back-volumes
-    networks:
-      - taiga
     depends_on:
+      _pre_init-taiga:
+        condition: service_completed_successfully
       taiga-db:
         condition: service_healthy
       taiga-events-rabbitmq:
         condition: service_started
       taiga-async-rabbitmq:
         condition: service_started
+    restart: on-failure
 
   taiga-async-rabbitmq:
     image: rabbitmq:3.8-management-alpine
@@ -92,9 +130,15 @@ services:
       RABBITMQ_DEFAULT_VHOST: "${RABBITMQ_VHOST}"
     hostname: "taiga-async-rabbitmq"
     volumes:
-      - taiga-async-rabbitmq-data:/var/lib/rabbitmq
-    networks:
-      - taiga
+      - type: volume
+        source: taiga
+        target: /var/lib/rabbitmq
+        volume:
+          subpath: async-rabbitmq-data
+    depends_on:
+      _pre_init-taiga:
+        condition: service_completed_successfully
+    restart: on-failure
 
   taiga-front:
     image: taigaio/taiga-front:latest
@@ -103,10 +147,9 @@ services:
       TAIGA_WEBSOCKETS_URL: "${WEBSOCKETS_SCHEME}://${TAIGA_DOMAIN}"
       TAIGA_SUBPATH: "${SUBPATH}"
       # ...your customizations go here
-    networks:
-      - taiga
     # volumes:
     #   - ./conf.json:/usr/share/nginx/html/conf.json
+    restart: on-failure
 
   taiga-events:
     image: taigaio/taiga-events:latest
@@ -114,11 +157,10 @@ services:
       RABBITMQ_USER: "${RABBITMQ_USER}"
       RABBITMQ_PASS: "${RABBITMQ_PASS}"
       TAIGA_SECRET_KEY: "${SECRET_KEY}"
-    networks:
-      - taiga
     depends_on:
       taiga-events-rabbitmq:
         condition: service_started
+    restart: on-failure
 
   taiga-events-rabbitmq:
     image: rabbitmq:3.8-management-alpine
@@ -129,39 +171,58 @@ services:
       RABBITMQ_DEFAULT_VHOST: "${RABBITMQ_VHOST}"
     hostname: "taiga-events-rabbitmq"
     volumes:
-      - taiga-events-rabbitmq-data:/var/lib/rabbitmq
-    networks:
-      - taiga
+      - type: volume
+        source: taiga
+        target: /var/lib/rabbitmq
+        volume:
+          subpath: events-rabbitmq-data
+    depends_on:
+      _pre_init-taiga:
+        condition: service_completed_successfully
+    restart: on-failure
 
   taiga-protected:
     image: taigaio/taiga-protected:latest
     environment:
       MAX_AGE: "${ATTACHMENTS_MAX_AGE}"
       SECRET_KEY: "${SECRET_KEY}"
-    networks:
-      - taiga
+    restart: on-failure
 
-  taiga-gateway:
+  taiga:
     image: nginx:1.19-alpine
-    ports:
-      - "9000:80"
     volumes:
       - ./taiga-gateway/taiga.conf:/etc/nginx/conf.d/default.conf
-      - taiga-static-data:/taiga/static
-      - taiga-media-data:/taiga/media
-    networks:
-      - taiga
+      - type: volume
+        source: taiga
+        target: /taiga/static
+        volume:
+          subpath: static-data
+      - type: volume
+        source: taiga
+        target: /taiga/media
+        volume:
+          subpath: media-data
     depends_on:
-      - taiga-front
-      - taiga-back
-      - taiga-events
+      taiga-front:
+        condition: service_started
+      taiga-back:
+        condition: service_healthy
+      taiga-events:
+        condition: service_started
+    restart: on-failure
+
+  _post_init-taiga:
+    image: taigaio/taiga-back:latest
+    environment:
+      <<: *default-back-environment
+      DJANGO_SUPERUSER_PASSWORD: ChangeMeRightNow
+    entrypoint: ""
+    volumes: *default-back-volumes
+    command: python manage.py createsuperuser --username=super --email=please@fix.me --noinput
+    depends_on:
+      taiga-back:
+        condition: service_healthy
 
 volumes:
-  taiga-static-data:
-  taiga-media-data:
-  taiga-db-data:
-  taiga-async-rabbitmq-data:
-  taiga-events-rabbitmq-data:
-
-networks:
   taiga:
+    external: true
